@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -124,6 +125,11 @@ var replyTests = []struct {
 		ve(float64(0.0), redis.ErrNil),
 	},
 	{
+		"float64Map([[]byte, []byte])",
+		ve(redis.Float64Map([]interface{}{[]byte("key1"), []byte("1.234"), []byte("key2"), []byte("5.678")}, nil)),
+		ve(map[string]float64{"key1": 1.234, "key2": 5.678}, nil),
+	},
+	{
 		"uint64(1)",
 		ve(redis.Uint64(int64(1), nil)),
 		ve(uint64(1), nil),
@@ -220,6 +226,98 @@ func TestSlowLog(t *testing.T) {
 	}
 }
 
+func TestLatency(t *testing.T) {
+	c, err := dial()
+	require.NoError(t, err)
+	defer c.Close()
+
+	resultStr, err := redis.Strings(c.Do("CONFIG", "GET", "latency-monitor-threshold"))
+	require.NoError(t, err)
+	// LATENCY commands were added in 2.8.13 so might not be supported.
+	if len(resultStr) == 0 {
+		t.Skip("Latency commands not supported")
+	}
+	latencyMonitorThresholdOldCfg, err := strconv.Atoi(resultStr[1])
+	require.NoError(t, err)
+	// Enable latency monitoring for events that take 1ms or longer.
+	result, err := c.Do("CONFIG", "SET", "latency-monitor-threshold", "1")
+	// reset the old configuration after test.
+	defer func() {
+		res, err := c.Do("CONFIG", "SET", "latency-monitor-threshold", latencyMonitorThresholdOldCfg)
+		require.NoError(t, err)
+		require.Equal(t, "OK", res)
+	}()
+
+	require.NoError(t, err)
+	require.Equal(t, "OK", result)
+
+	// Sleep for 1ms to register a slow event.
+	_, err = c.Do("DEBUG", "SLEEP", 0.001)
+	require.NoError(t, err)
+
+	result, err = c.Do("LATENCY", "LATEST")
+	require.NoError(t, err)
+
+	latestLatencies, err := redis.Latencies(result, err)
+	require.NoError(t, err)
+
+	require.Equal(t, 1, len(latestLatencies))
+
+	latencyEvent := latestLatencies[0]
+	expected := redis.Latency{
+		Name:   "command",
+		Latest: time.Millisecond,
+		Max:    time.Millisecond,
+		Time:   latencyEvent.Time,
+	}
+	require.Equal(t, latencyEvent, expected)
+}
+
+func TestLatencyHistories(t *testing.T) {
+	c, err := dial()
+	require.NoError(t, err)
+	defer c.Close()
+
+	res, err := redis.Strings(c.Do("CONFIG", "GET", "latency-monitor-threshold"))
+	require.NoError(t, err)
+
+	// LATENCY commands were added in 2.8.13 so might not be supported.
+	if len(res) == 0 {
+		t.Skip("Latency commands not supported")
+	}
+	latencyMonitorThresholdOldCfg, err := strconv.Atoi(res[1])
+	require.NoError(t, err)
+
+	// Reset so we're compatible with -count=X
+	_, err = c.Do("LATENCY", "RESET", "command")
+	require.NoError(t, err)
+
+	// Enable latency monitoring for events that take 1ms or longer
+	result, err := c.Do("CONFIG", "SET", "latency-monitor-threshold", "1")
+	// reset the old configuration after test.
+	defer func() {
+		res, err := c.Do("CONFIG", "SET", "latency-monitor-threshold", latencyMonitorThresholdOldCfg)
+		require.NoError(t, err)
+		require.Equal(t, "OK", res)
+	}()
+	require.NoError(t, err)
+	require.Equal(t, "OK", result)
+
+	// Sleep for 1ms to register a slow event
+	_, err = c.Do("DEBUG", "SLEEP", 0.001)
+	require.NoError(t, err)
+
+	result, err = c.Do("LATENCY", "HISTORY", "command")
+	require.NoError(t, err)
+
+	latencyHistory, err := redis.LatencyHistories(result, err)
+	require.NoError(t, err)
+
+	require.Len(t, latencyHistory, 1)
+	latencyEvent := latencyHistory[0]
+	require.Equal(t, time.Millisecond, latencyEvent.ExecutionTime)
+}
+
 // dial wraps DialDefaultServer() with a more suitable function name for examples.
 func dial() (redis.Conn, error) {
 	return redis.DialDefaultServer()
@@ -238,8 +336,16 @@ func ExampleBool() {
 	}
 	defer c.Close()
 
-	c.Do("SET", "foo", 1)
-	exists, _ := redis.Bool(c.Do("EXISTS", "foo"))
+	if _, err = c.Do("SET", "foo", 1); err != nil {
+		fmt.Println(err)
+		return
+	}
+	exists, err := redis.Bool(c.Do("EXISTS", "foo"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
 	fmt.Printf("%#v\n", exists)
 	// Output:
 	// true
@@ -253,10 +359,22 @@ func ExampleInt() {
 	}
 	defer c.Close()
 
-	c.Do("SET", "k1", 1)
-	n, _ := redis.Int(c.Do("GET", "k1"))
+	_, err = c.Do("SET", "k1", 1)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	n, err := redis.Int(c.Do("GET", "k1"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	fmt.Printf("%#v\n", n)
-	n, _ = redis.Int(c.Do("INCR", "k1"))
+	n, err = redis.Int(c.Do("INCR", "k1"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	fmt.Printf("%#v\n", n)
 	// Output:
 	// 1
@@ -271,8 +389,16 @@ func ExampleInts() {
 	}
 	defer c.Close()
 
-	c.Do("SADD", "set_with_integers", 4, 5, 6)
-	ints, _ := redis.Ints(c.Do("SMEMBERS", "set_with_integers"))
+	_, err = c.Do("SADD", "set_with_integers", 4, 5, 6)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	ints, err := redis.Ints(c.Do("SMEMBERS", "set_with_integers"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	fmt.Printf("%#v\n", ints)
 	// Output:
 	// []int{4, 5, 6}
@@ -286,8 +412,16 @@ func ExampleString() {
 	}
 	defer c.Close()
 
-	c.Do("SET", "hello", "world")
+	_, err = c.Do("SET", "hello", "world")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	s, err := redis.String(c.Do("GET", "hello"))
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 	fmt.Printf("%#v\n", s)
 	// Output:
 	// "world"

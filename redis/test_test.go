@@ -16,6 +16,7 @@ package redis
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +56,51 @@ type Server struct {
 	done chan struct{}
 }
 
+type version struct {
+	major int
+	minor int
+	patch int
+}
+
+func redisServerVersion() (*version, error) {
+	out, err := exec.Command("redis-server", "--version").Output()
+	if err != nil {
+		return nil, fmt.Errorf("server version: %w", err)
+	}
+
+	ver := string(out)
+	re := regexp.MustCompile(`v=(\d+)\.(\d+)\.(\d+)`)
+	match := re.FindStringSubmatch(ver)
+	if len(match) != 4 {
+		return nil, fmt.Errorf("no server version found in %q", ver)
+	}
+
+	var v version
+	if v.major, err = strconv.Atoi(match[1]); err != nil {
+		return nil, fmt.Errorf("invalid major version %q", match[1])
+	}
+
+	if v.minor, err = strconv.Atoi(match[2]); err != nil {
+		return nil, fmt.Errorf("invalid minor version %q", match[2])
+	}
+
+	if v.patch, err = strconv.Atoi(match[3]); err != nil {
+		return nil, fmt.Errorf("invalid patch version %q", match[3])
+	}
+
+	return &v, nil
+}
+
 func NewServer(name string, args ...string) (*Server, error) {
+	version, err := redisServerVersion()
+	if err != nil {
+		return nil, err
+	}
+
+	if version.major >= 7 {
+		args = append(args, "--enable-debug-command", "local")
+	}
+
 	s := &Server{
 		name: name,
 		cmd:  exec.Command(*serverPath, args...),
@@ -107,13 +153,17 @@ func (s *Server) watch(r io.Reader, ready chan error) {
 	if !listening {
 		ready <- fmt.Errorf("server exited: %s", text)
 	}
-	s.cmd.Wait()
+	if err := s.cmd.Wait(); err != nil {
+		if listening {
+			ready <- err
+		}
+	}
 	fmt.Fprintf(serverLog, "%d STOP %s \n", s.cmd.Process.Pid, s.name)
 	close(s.done)
 }
 
 func (s *Server) Stop() {
-	s.cmd.Process.Signal(os.Interrupt)
+	s.cmd.Process.Signal(os.Interrupt) // nolint: errcheck
 	<-s.done
 }
 
@@ -148,15 +198,23 @@ func DefaultServerAddr() (string, error) {
 // DialDefaultServer starts the test server if not already started and dials a
 // connection to the server.
 func DialDefaultServer(options ...DialOption) (Conn, error) {
+	return DialDefaultServerContext(context.Background(), options...)
+}
+
+// DialDefaultServerContext starts the test server if not already started and
+// dials a connection to the server with the given context.
+func DialDefaultServerContext(ctx context.Context, options ...DialOption) (Conn, error) {
 	addr, err := DefaultServerAddr()
 	if err != nil {
 		return nil, err
 	}
-	c, err := Dial("tcp", addr, append([]DialOption{DialReadTimeout(1 * time.Second), DialWriteTimeout(1 * time.Second)}, options...)...)
+	c, err := DialContext(ctx, "tcp", addr, append([]DialOption{DialReadTimeout(1 * time.Second), DialWriteTimeout(1 * time.Second)}, options...)...)
 	if err != nil {
 		return nil, err
 	}
-	c.Do("FLUSHDB")
+	if _, err = DoContext(c, ctx, "FLUSHDB"); err != nil {
+		return nil, err
+	}
 	return c, nil
 }
 
